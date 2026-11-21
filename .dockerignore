@@ -1,0 +1,9 @@
+dev
+dev5m
+out
+out5
+out5ref
+scratch
+fixtures
+.git
+**/__pycache__
