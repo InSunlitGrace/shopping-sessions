@@ -7,3 +7,13 @@ scratch/
 pipeline/sessions
 __pycache__/
 *.pyc
+dev/
+dev5m/
+dev20m/
+out/
+out5/
+out5ref/
+out20/
+out20ref/
+pipeline/sessions
+pipeline/sessions_old
