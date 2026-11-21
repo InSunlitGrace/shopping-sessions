@@ -2,7 +2,7 @@ FROM debian:bookworm-slim AS build
 RUN apt-get update && apt-get install -y --no-install-recommends g++ \
     && rm -rf /var/lib/apt/lists/*
 COPY cpp/sessions.cpp /src/sessions.cpp
-RUN g++ -O3 -std=c++17 -pthread -static-libstdc++ -static-libgcc -o /src/sessions /src/sessions.cpp
+RUN g++ -O3 -std=c++17 -pthread -march=x86-64-v3 -static -o /src/sessions /src/sessions.cpp
 
 FROM debian:bookworm-slim
 COPY --from=build /src/sessions /app/sessions

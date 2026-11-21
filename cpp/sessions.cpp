@@ -4,22 +4,25 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <malloc.h>
 using namespace std;
 typedef string_view sv;
 typedef long long ll;
-
+ 
 static const ll BAD=LLONG_MIN;
 static const ll DAY=86400000LL;
 static const ll WEEK=7*DAY;
 static const ll GAP=1800000LL;
-static const int NS=64;
+static const int NS=256;
 static const int NB=256;
 static int NT=8;
-
+static ll D0;
+static int ND;
+ 
 static double nowt(){timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9;}
 static double TL=nowt();
 static void lap(const char*n){double t=nowt();fprintf(stderr,"%s: %.2fs\n",n,t-TL);TL=t;}
-
+ 
 template<class F> static void pfor(size_t n,F f){
     atomic<size_t> nx(0);
     auto w=[&](int tid){
@@ -34,7 +37,7 @@ template<class F> static void pfor(size_t n,F f){
     w(0);
     for(auto&x:th)x.join();
 }
-
+ 
 static inline uint64_t hsh(sv s){
     const char*p=s.data();
     size_t n=s.size();
@@ -57,60 +60,54 @@ static inline uint64_t hsh(sv s){
     return h;
 }
 static inline int shardH(uint64_t h,int n){return (int)((h>>40)%(uint64_t)n);}
-
-// flat open-addressing map from string to dense index
+ 
+// flat open-addressing map from string to dense index (hash+index interleaved)
 struct FM{
-    vector<uint64_t> sh;
-    vector<uint32_t> si;
+    struct Sl{uint64_t h;uint32_t i;};
+    vector<Sl> t;
     vector<sv> keys;
     size_t mask=0;
     FM(){init(8);}
     void init(size_t want){
         size_t c=16;
         while(c<want*2)c<<=1;
-        sh.assign(c,0);
-        si.assign(c,0);
+        t.assign(c,Sl{0,0});
         mask=c-1;
     }
     uint32_t find(sv k,uint64_t h)const{
         size_t i=h&mask;
-        while(si[i]){
-            if(sh[i]==h&&keys[si[i]-1]==k)return si[i]-1;
+        while(t[i].i){
+            if(t[i].h==h&&keys[t[i].i-1]==k)return t[i].i-1;
             i=(i+1)&mask;
         }
         return UINT32_MAX;
     }
     uint32_t add(sv k,uint64_t h,bool&added){
-        if((keys.size()+1)*2>sh.size())grow();
+        if((keys.size()+1)*2>t.size())grow();
         size_t i=h&mask;
-        while(si[i]){
-            if(sh[i]==h&&keys[si[i]-1]==k){added=false;return si[i]-1;}
+        while(t[i].i){
+            if(t[i].h==h&&keys[t[i].i-1]==k){added=false;return t[i].i-1;}
             i=(i+1)&mask;
         }
         keys.push_back(k);
-        sh[i]=h;
-        si[i]=(uint32_t)keys.size();
+        t[i]=Sl{h,(uint32_t)keys.size()};
         added=true;
         return (uint32_t)keys.size()-1;
     }
     void grow(){
-        vector<uint64_t> oh;
-        vector<uint32_t> oi;
-        oh.swap(sh);
-        oi.swap(si);
-        size_t c=oh.size()*2;
-        sh.assign(c,0);
-        si.assign(c,0);
+        vector<Sl> o;
+        o.swap(t);
+        size_t c=o.size()*2;
+        t.assign(c,Sl{0,0});
         mask=c-1;
-        for(size_t j=0;j<oh.size();j++)if(oi[j]){
-            size_t i=oh[j]&mask;
-            while(si[i])i=(i+1)&mask;
-            sh[i]=oh[j];
-            si[i]=oi[j];
+        for(size_t j=0;j<o.size();j++)if(o[j].i){
+            size_t i=o[j].h&mask;
+            while(t[i].i)i=(i+1)&mask;
+            t[i]=o[j];
         }
     }
 };
-
+ 
 static vector<string> listcsv(const string&dir){
     vector<string> r;
     DIR*d=opendir(dir.c_str());
@@ -123,9 +120,9 @@ static vector<string> listcsv(const string&dir){
     sort(r.begin(),r.end());
     return r;
 }
-
+ 
 struct Chunk{const char*b;const char*e;};
-
+ 
 static void addChunks(const vector<string>&paths,vector<Chunk>&out,size_t CH){
     for(const string&path:paths){
         int fd=open(path.c_str(),O_RDONLY);
@@ -150,7 +147,7 @@ static void addChunks(const vector<string>&paths,vector<Chunk>&out,size_t CH){
         }
     }
 }
-
+ 
 static bool split(const char*p,const char*e,int nc,sv*out){
     int k=0;
     while(true){
@@ -170,7 +167,7 @@ static bool split(const char*p,const char*e,int nc,sv*out){
     }
     return k==nc;
 }
-
+ 
 template<class F> static void rows(const Chunk&ch,int nc,F f){
     const char*p=ch.b;
     const char*e=ch.e;
@@ -182,13 +179,13 @@ template<class F> static void rows(const Chunk&ch,int nc,F f){
         p=q?q+1:e;
     }
 }
-
+ 
 template<class F> static void eachrow(const vector<string>&paths,int nc,F f){
     vector<Chunk> c;
     addChunks(paths,c,(size_t)1<<40);
     for(auto&ch:c)rows(ch,nc,f);
 }
-
+ 
 static inline bool dg(char c){return c>='0'&&c<='9';}
 static inline int num(const char*p,int n){
     int v=0;
@@ -203,7 +200,7 @@ static ll days_from_civil(ll y,int m,int d){
     ll doe=yoe*365+yoe/4-yoe/100+doy;
     return era*146097+doe-719468;
 }
-
+ 
 static ll parse_ts(sv s){
     size_t n=s.size();
     if(n==0)return BAD;
@@ -243,7 +240,7 @@ static ll parse_ts(sv s){
     ll days=days_from_civil(y,mo,d);
     return ((days*86400LL+h*3600LL+mi*60LL+se)*1000LL)-off;
 }
-
+ 
 static ll parse_price(sv s){
     size_t n=s.size();
     if(n==0)return -1;
@@ -255,7 +252,7 @@ static ll parse_price(sv s){
     for(;k<n;k++)v=v*10+(s[k]-'0');
     return (v>=1&&v<=10000000)?v:-1;
 }
-
+ 
 // ---------------- minimal Parquet writer ----------------
 struct TW{
     string b;vector<int> st;int cur=0;
@@ -366,10 +363,12 @@ static void writeParquet(const string&path,vector<Col>&cols,ll nrows){
     fwrite(f.data(),1,f.size(),fp);
     fclose(fp);
 }
-
+ 
 // ---- links (single-threaded build, read-only afterwards) ----
 static FM lm;
 static vector<uint32_t> par;
+struct Root{sv name;uint64_t h;};
+static vector<Root> root;
 static uint32_t lget(sv s){
     bool a;
     return lm.add(s,hsh(s),a);
@@ -381,7 +380,7 @@ static uint32_t findr(uint32_t x){
     }
     return x;
 }
-
+ 
 struct EvRec{sv id,user,prod;uint64_t h;ll ts,ing,price;int type;};
 struct EvB{sv name;uint64_t nh;ll ts;int32_t price;uint8_t cat;};
 struct CkB{sv name;uint64_t nh;ll ts;uint32_t camp;sv id;};
@@ -389,16 +388,19 @@ struct E2{uint32_t p;ll ts;int32_t price;uint8_t cat;};
 struct K2{uint32_t p;ll ts;uint32_t camp;sv id;};
 struct CA{ll s=0,ps=0,rev=0,as=0;};
 struct UdRow{sv name;int32_t day;ll s,e,r;int cat;};
-struct Out{vector<UdRow> ud;unordered_map<uint64_t,CA> cam;};
-
+struct Out{vector<UdRow> ud;};
+struct Slot{uint64_t h;uint32_t idx;};
+ 
 int main(){
+    mallopt(M_TRIM_THRESHOLD,-1);
     const char*e1=getenv("DATA_DIR");
     const char*e3=getenv("NCPU");
     string DATA=e1?e1:"/data";
     string OUT=getenv("OUTPUT_DIR")?getenv("OUTPUT_DIR"):"/output";
     if(e3)NT=max(1,atoi(e3));
     else NT=max(1,(int)thread::hardware_concurrency());
-
+    mallopt(M_ARENA_MAX,NT);
+ 
     ll WS,WE;
     {
         ifstream in(DATA+"/manifest.json");
@@ -413,7 +415,9 @@ int main(){
         WS=getw("window_start");
         WE=getw("window_end");
     }
-
+    D0=WS/DAY;
+    ND=(int)((WE-1)/DAY-D0+1);
+ 
     set<sv> catset;
     vector<pair<sv,sv>> prows;
     eachrow({DATA+"/products.csv"},2,[&](sv*f){
@@ -435,7 +439,7 @@ int main(){
         else pcat[i]=catid[pr.second];
     }
     int ncat=(int)catnames.size();
-
+ 
     FM cm;
     vector<sv> campid,campch;
     eachrow({DATA+"/campaigns.csv"},2,[&](sv*f){
@@ -447,7 +451,7 @@ int main(){
     uint32_t ncamp=(uint32_t)campid.size();
     uint32_t organic=ncamp;
     lap("setup");
-
+ 
     {
         vector<pair<uint32_t,uint32_t>> edges;
         eachrow(listcsv(DATA+"/links"),2,[&](sv*f){
@@ -466,9 +470,14 @@ int main(){
             else par[ra]=rb;
         }
         for(size_t k=0;k<par.size();k++)par[k]=findr((uint32_t)k);
+        root.resize(par.size());
+        for(size_t k=0;k<par.size();k++){
+            sv nm=lm.keys[par[k]];
+            root[k]={nm,hsh(nm)};
+        }
     }
     lap("links");
-
+ 
     // ---- phase A: parallel parse events into shards ----
     vector<Chunk> echunks;
     addChunks(listcsv(DATA+"/events"),echunks,4<<20);
@@ -488,7 +497,7 @@ int main(){
         });
     });
     lap("A parse events");
-
+ 
     // ---- phase B: dedup per shard, validate, route to person buckets ----
     vector<vector<vector<EvB>>> eb(NT,vector<vector<EvB>>(NB));
     pfor(NS,[&](size_t s,int tid){
@@ -497,28 +506,38 @@ int main(){
         size_t cap=16;
         while(cap<tot*2)cap<<=1;
         size_t mask=cap-1;
-        vector<uint32_t> tab(cap,0);
+        vector<Slot> tab(cap,Slot{0,0});
         vector<const EvRec*> kept;
         kept.reserve(tot);
         for(int t=0;t<NT;t++)for(const EvRec&r:loc[t][s]){
             size_t i=r.h&mask;
             bool found=false;
-            while(tab[i]){
-                const EvRec*k=kept[tab[i]-1];
-                if(k->h==r.h&&k->id==r.id){
-                    if(r.ing<k->ing)kept[tab[i]-1]=&r;
-                    found=true;
-                    break;
+            while(tab[i].idx){
+                if(tab[i].h==r.h){
+                    const EvRec*k=kept[tab[i].idx-1];
+                    if(k->id==r.id){
+                        if(r.ing<k->ing)kept[tab[i].idx-1]=&r;
+                        found=true;
+                        break;
+                    }
                 }
                 i=(i+1)&mask;
             }
             if(!found){
                 kept.push_back(&r);
-                tab[i]=(uint32_t)kept.size();
+                tab[i]=Slot{r.h,(uint32_t)kept.size()};
             }
         }
-        for(const EvRec*pr:kept){
-            const EvRec&r=*pr;
+        const size_t PF=8;
+        for(size_t j=0;j<kept.size();j++){
+            if(j+PF<kept.size()){
+                const EvRec*q=kept[j+PF];
+                if(!q->user.empty()){
+                    uint64_t qh=hsh(q->user);
+                    __builtin_prefetch(&lm.t[qh&lm.mask]);
+                }
+            }
+            const EvRec&r=*kept[j];
             if(r.user.empty()||r.ts==BAD||r.ts<WS||r.ts>=WE)continue;
             if(r.type==0||r.prod.empty())continue;
             if(r.type==3&&r.price<1)continue;
@@ -534,14 +553,14 @@ int main(){
             uint64_t nh=hsh(name);
             uint32_t li=lm.find(name,nh);
             if(li!=UINT32_MAX){
-                name=lm.keys[par[li]];
-                nh=hsh(name);
+                name=root[li].name;
+                nh=root[li].h;
             }
             eb[tid][shardH(nh,NB)].push_back({name,nh,r.ts,price,cat});
         }
     });
     lap("B dedup+route");
-
+ 
     // ---- clicks: parallel parse and route ----
     vector<Chunk> cchunks;
     addChunks(listcsv(DATA+"/clicks"),cchunks,4<<20);
@@ -557,17 +576,19 @@ int main(){
             uint64_t nh=hsh(name);
             uint32_t li=lm.find(name,nh);
             if(li!=UINT32_MAX){
-                name=lm.keys[par[li]];
-                nh=hsh(name);
+                name=root[li].name;
+                nh=root[li].h;
             }
             cb[tid][shardH(nh,NB)].push_back({name,nh,ts,c,f[0]});
         });
     });
     lap("clicks");
-
+ 
     // ---- phase C: per bucket sort + sweep ----
     vector<Out> outs(NB);
-    pfor(NB,[&](size_t b,int){
+    vector<vector<CA>> tcam(NT,vector<CA>((size_t)(ncamp+1)*ND));
+    pfor(NB,[&](size_t b,int tid){
+        CA*cam=tcam[tid].data();
         FM pl;
         auto pid=[&](sv s,uint64_t h){
             bool a;
@@ -592,22 +613,12 @@ int main(){
             if(a.ts!=c.ts)return a.ts<c.ts;
             return a.id<c.id;
         });
-
+ 
         Out&o=outs[b];
-        vector<int> cnt(ncamp+1,0),pos(ncamp+1,0);
-        vector<uint32_t> active;
-        auto addc=[&](uint32_t c){
-            if(cnt[c]++==0){pos[c]=(int)active.size();active.push_back(c);}
-        };
-        auto remc=[&](uint32_t c){
-            if(--cnt[c]==0){
-                uint32_t last=active.back();
-                active[pos[c]]=last;
-                pos[last]=pos[c];
-                active.pop_back();
-            }
-        };
-        auto key=[](uint32_t c,ll day){return ((uint64_t)c<<32)|(uint64_t)day;};
+        vector<int> cov(ncamp,-1);
+        vector<uint32_t> touched;
+        vector<ll> sst;
+        vector<int> slot,dd,dlo,dhi;
         vector<ll> daycat(ncat,0);
         ll curday=-1,dsess=0,devs=0,drev=0;
         auto flush=[&](uint32_t p){
@@ -615,11 +626,11 @@ int main(){
             int best=-1;
             ll mx=0;
             for(int k=0;k<ncat;k++)if(daycat[k]>mx){mx=daycat[k];best=k;}
-            o.ud.push_back({pl.keys[p],(int32_t)curday,(ll)dsess,(ll)devs,(ll)drev,best});
+            o.ud.push_back({pl.keys[p],(int32_t)curday,dsess,devs,drev,best});
             fill(daycat.begin(),daycat.end(),0);
             curday=-1;dsess=0;devs=0;drev=0;
         };
-
+ 
         size_t cbp=0,i=0;
         while(i<ev.size()){
             uint32_t p=ev[i].p;
@@ -629,6 +640,7 @@ int main(){
             size_t ce=cbp;
             while(ce<ck.size()&&ck[ce].p==p)ce++;
             size_t lo=cbp,hi=cbp;
+            sst.clear();slot.clear();dd.clear();dlo.clear();dhi.clear();
             size_t e=i;
             while(e<ie){
                 ll s=ev[e].ts;
@@ -643,35 +655,60 @@ int main(){
                     f++;
                 }
                 dsess++;devs+=(ll)(f-e);drev+=rev;
-                while(hi<ce&&ck[hi].ts<=s){addc(ck[hi].camp);hi++;}
-                while(lo<hi&&ck[lo].ts<s-WEEK){remc(ck[lo].camp);lo++;}
+                while(hi<ce&&ck[hi].ts<=s)hi++;
+                while(lo<hi&&ck[lo].ts<s-WEEK)lo++;
                 uint32_t camp=organic;
                 if(lo<hi){
                     size_t last=hi-1,j=last;
                     while(j>lo&&ck[j-1].ts==ck[last].ts)j--;
                     camp=ck[j].camp;
                 }
-                CA&a=o.cam[key(camp,day)];
+                int di=(int)(day-D0);
+                CA&a=cam[(size_t)camp*ND+di];
                 a.s++;
                 if(hp)a.ps++;
                 a.rev+=rev;
-                for(uint32_t c:active)o.cam[key(c,day)].as++;
+                int idx=(int)sst.size();
+                sst.push_back(s);
+                if(dd.empty()||dd.back()!=di){dd.push_back(di);dlo.push_back(idx);dhi.push_back(idx);}
+                else dhi.back()=idx;
+                slot.push_back((int)dd.size()-1);
                 e=f;
             }
             flush(p);
-            for(size_t k=lo;k<hi;k++)remc(ck[k].camp);
+            // assists: sessions with start in [click.ts, click.ts+WEEK]
+            size_t m=sst.size(),pl_=0,pr=0;
+            for(size_t k=cbp;k<ce;k++){
+                ll t=ck[k].ts;
+                while(pl_<m&&sst[pl_]<t)pl_++;
+                while(pr<m&&sst[pr]<=t+WEEK)pr++;
+                int l=(int)pl_,r=(int)pr-1;
+                if(l>r)continue;
+                uint32_t c=ck[k].camp;
+                int l2=max(l,cov[c]+1);
+                if(l2>r)continue;
+                if(cov[c]<0)touched.push_back(c);
+                cov[c]=r;
+                for(int sl=slot[l2];sl<=slot[r];sl++){
+                    int a=max(l2,dlo[sl]),z=min(r,dhi[sl]);
+                    cam[(size_t)c*ND+dd[sl]].as+=z-a+1;
+                }
+            }
+            for(uint32_t c:touched)cov[c]=-1;
+            touched.clear();
             cbp=ce;
             i=ie;
         }
     });
     lap("C sort+sweep");
-
+ 
     // ---- output: write Parquet directly ----
     mkdir(OUT.c_str(),0755);
     mkdir((OUT+"/user_daily").c_str(),0755);
     mkdir((OUT+"/campaign_daily").c_str(),0755);
-
-    thread tu([&]{
+ 
+    vector<thread> wt;
+    for(int w=0;w<NT;w++)wt.emplace_back([&,w]{
         vector<Col> c(6);
         c[0]={"user_id",6,0,false};
         c[1]={"day",1,6,false};
@@ -680,7 +717,7 @@ int main(){
         c[4]={"revenue_cents",2,-1,false};
         c[5]={"top_category",6,0,true};
         ll n=0;
-        for(auto&o:outs)for(const UdRow&r:o.ud){
+        for(size_t b=w;b<(size_t)NB;b+=NT)for(const UdRow&r:outs[b].ud){
             c[0].as(r.name);
             c[1].a32(r.day);
             c[2].a64(r.s);
@@ -690,15 +727,16 @@ int main(){
             else c[5].defd.push_back(0);
             n++;
         }
-        writeParquet(OUT+"/user_daily/part-0.parquet",c,n);
+        if(n||w==0)writeParquet(OUT+"/user_daily/part-"+to_string(w)+".parquet",c,n);
     });
-
-    unordered_map<uint64_t,CA> cam;
-    for(auto&o:outs)for(auto&kv:o.cam){
-        CA&a=cam[kv.first];
-        a.s+=kv.second.s;a.ps+=kv.second.ps;a.rev+=kv.second.rev;a.as+=kv.second.as;
-    }
+ 
     {
+        vector<CA> cam((size_t)(ncamp+1)*ND);
+        for(int t=0;t<NT;t++)for(size_t k=0;k<cam.size();k++){
+            CA&a=cam[k];
+            const CA&x=tcam[t][k];
+            a.s+=x.s;a.ps+=x.ps;a.rev+=x.rev;a.as+=x.as;
+        }
         vector<Col> c(7);
         c[0]={"campaign_id",6,0,false};
         c[1]={"channel",6,0,false};
@@ -708,20 +746,24 @@ int main(){
         c[5]={"revenue_cents",2,-1,false};
         c[6]={"assisted_sessions",2,-1,false};
         ll n=0;
-        for(auto&kv:cam){
-            uint32_t k=(uint32_t)(kv.first>>32);
-            c[0].as(k==organic?sv("organic"):campid[k]);
-            c[1].as(k==organic?sv("organic"):campch[k]);
-            c[2].a32((int32_t)(kv.first&0xffffffffULL));
-            c[3].a64(kv.second.s);
-            c[4].a64(kv.second.ps);
-            c[5].a64(kv.second.rev);
-            c[6].a64(kv.second.as);
+        for(size_t k=0;k<cam.size();k++){
+            const CA&a=cam[k];
+            if(!a.s&&!a.as)continue;
+            uint32_t ci=(uint32_t)(k/ND);
+            c[0].as(ci==organic?sv("organic"):campid[ci]);
+            c[1].as(ci==organic?sv("organic"):campch[ci]);
+            c[2].a32((int32_t)(D0+(ll)(k%ND)));
+            c[3].a64(a.s);
+            c[4].a64(a.ps);
+            c[5].a64(a.rev);
+            c[6].a64(a.as);
             n++;
         }
         writeParquet(OUT+"/campaign_daily/part-0.parquet",c,n);
     }
-    tu.join();
+    for(auto&t:wt)t.join();
     lap("write");
-    return 0;
+    fflush(stderr);
+    _exit(0);
 }
+ 
