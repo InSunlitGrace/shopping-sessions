@@ -12,6 +12,33 @@ static const ll BAD=LLONG_MIN;
 static const ll DAY=86400000LL;
 static const ll WEEK=7*DAY;
 static const ll GAP=1800000LL;
+static const int NS=64;
+static const int NB=64;
+static int NT=8;
+
+static double nowt(){timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9;}
+static double TL=nowt();
+static void lap(const char*n){double t=nowt();fprintf(stderr,"%s: %.2fs\n",n,t-TL);TL=t;}
+
+template<class F> static void pfor(size_t n,F f){
+    atomic<size_t> nx(0);
+    auto w=[&](int tid){
+        for(;;){
+            size_t i=nx.fetch_add(1);
+            if(i>=n)break;
+            f(i,tid);
+        }
+    };
+    vector<thread> th;
+    for(int t=1;t<NT;t++)th.emplace_back(w,t);
+    w(0);
+    for(auto&x:th)x.join();
+}
+
+static inline int shardOf(sv s,int n){
+    uint64_t h=std::hash<sv>{}(s)*0x9E3779B97F4A7C15ULL;
+    return (int)((h>>40)%n);
+}
 
 static vector<string> listcsv(const string&dir){
     vector<string> r;
@@ -24,6 +51,33 @@ static vector<string> listcsv(const string&dir){
     closedir(d);
     sort(r.begin(),r.end());
     return r;
+}
+
+struct Chunk{const char*b;const char*e;};
+
+static void addChunks(const vector<string>&paths,vector<Chunk>&out,size_t CH){
+    for(const string&path:paths){
+        int fd=open(path.c_str(),O_RDONLY);
+        if(fd<0)continue;
+        struct stat st;
+        fstat(fd,&st);
+        if(st.st_size==0){close(fd);continue;}
+        const char*p=(const char*)mmap(0,st.st_size,PROT_READ,MAP_PRIVATE,fd,0);
+        close(fd);
+        if(p==MAP_FAILED)continue;
+        const char*e=p+st.st_size;
+        const char*nl=(const char*)memchr(p,'\n',e-p);
+        if(!nl)continue;
+        const char*s=nl+1;
+        while(s<e){
+            const char*t=s+CH;
+            if(t>=e){out.push_back({s,e});break;}
+            const char*q=(const char*)memchr(t,'\n',e-t);
+            const char*en=q?q+1:e;
+            out.push_back({s,en});
+            s=en;
+        }
+    }
 }
 
 static bool split(const char*p,const char*e,int nc,sv*out){
@@ -46,27 +100,22 @@ static bool split(const char*p,const char*e,int nc,sv*out){
     return k==nc;
 }
 
-template<class F> static void eachrow(const vector<string>&paths,int nc,F f){
-    for(const string&path:paths){
-        int fd=open(path.c_str(),O_RDONLY);
-        if(fd<0)continue;
-        struct stat st;
-        fstat(fd,&st);
-        if(st.st_size==0){close(fd);continue;}
-        const char*p=(const char*)mmap(0,st.st_size,PROT_READ,MAP_PRIVATE,fd,0);
-        close(fd);
-        const char*e=p+st.st_size;
-        const char*nl=(const char*)memchr(p,'\n',e-p);
-        if(!nl)continue;
-        p=nl+1;
-        sv fields[8];
-        while(p<e){
-            const char*q=(const char*)memchr(p,'\n',e-p);
-            const char*le=q?q:e;
-            if(split(p,le,nc,fields))f(fields);
-            p=q?q+1:e;
-        }
+template<class F> static void rows(const Chunk&ch,int nc,F f){
+    const char*p=ch.b;
+    const char*e=ch.e;
+    sv fields[8];
+    while(p<e){
+        const char*q=(const char*)memchr(p,'\n',e-p);
+        const char*le=q?q:e;
+        if(split(p,le,nc,fields))f(fields);
+        p=q?q+1:e;
     }
+}
+
+template<class F> static void eachrow(const vector<string>&paths,int nc,F f){
+    vector<Chunk> c;
+    addChunks(paths,c,(size_t)1<<40);
+    for(auto&ch:c)rows(ch,nc,f);
 }
 
 static inline bool dg(char c){return c>='0'&&c<='9';}
@@ -82,18 +131,6 @@ static ll days_from_civil(ll y,int m,int d){
     ll doy=(153*(m>2?m-3:m+9)+2)/5+d-1;
     ll doe=yoe*365+yoe/4-yoe/100+doy;
     return era*146097+doe-719468;
-}
-static void civil(ll z,int&y,int&m,int&d){
-    z+=719468;
-    ll era=(z>=0?z:z-146096)/146097;
-    ll doe=z-era*146097;
-    ll yoe=(doe-doe/1460+doe/36524-doe/146096)/365;
-    ll yy=yoe+era*400;
-    ll doy=doe-(365*yoe+yoe/4-yoe/100);
-    ll mp=(5*doy+2)/153;
-    d=(int)(doy-(153*mp+2)/5+1);
-    m=(int)(mp<10?mp+3:mp-9);
-    y=(int)(yy+(m<=2));
 }
 
 static ll parse_ts(sv s){
@@ -148,17 +185,126 @@ static ll parse_price(sv s){
     return (v>=1&&v<=10000000)?v:-1;
 }
 
-struct Interner{
-    unordered_map<sv,uint32_t> m;
-    vector<sv> names;
-    uint32_t get(sv s){
-        auto r=m.emplace(s,(uint32_t)names.size());
-        if(r.second)names.push_back(s);
-        return r.first->second;
+// ---------------- minimal Parquet writer ----------------
+struct TW{
+    string b;vector<int> st;int cur=0;
+    void varint(uint64_t v){while(v>=0x80){b.push_back((char)(v|0x80));v>>=7;}b.push_back((char)v);}
+    void zz(ll v){varint(((uint64_t)v<<1)^(uint64_t)(v>>63));}
+    void fld(int id,int type){
+        int d=id-cur;
+        if(d>0&&d<=15)b.push_back((char)((d<<4)|type));
+        else{b.push_back((char)type);zz(id);}
+        cur=id;
     }
+    void i32(int id,int v){fld(id,5);zz(v);}
+    void i64(int id,ll v){fld(id,6);zz(v);}
+    void str(int id,const string&s){fld(id,8);varint(s.size());b+=s;}
+    void lst(int id,int et,size_t n){
+        fld(id,9);
+        if(n<15)b.push_back((char)((n<<4)|et));
+        else{b.push_back((char)(0xF0|et));varint(n);}
+    }
+    void sbeg(int id){fld(id,12);st.push_back(cur);cur=0;}
+    void lbeg(){st.push_back(cur);cur=0;}
+    void send(){b.push_back(0);cur=st.back();st.pop_back();}
 };
-static Interner I;
+struct Col{
+    string name;int type;int conv;bool opt;string data;
+    vector<uint8_t> defd;
+    void a32(int32_t v){data.append((const char*)&v,4);}
+    void a64(int64_t v){data.append((const char*)&v,8);}
+    void as(sv s){uint32_t n=(uint32_t)s.size();data.append((const char*)&n,4);data.append(s.data(),s.size());}
+};
+static void writeParquet(const string&path,vector<Col>&cols,ll nrows){
+    string f="PAR1";
+    vector<ll> offs,sizes;
+    for(auto&c:cols){
+        string body;
+        if(c.opt){
+            size_t n=c.defd.size(),ng=(n+7)/8;
+            TW t;
+            t.varint((ng<<1)|1);
+            string lv=t.b;
+            string bits(ng,'\0');
+            for(size_t i=0;i<n;i++)if(c.defd[i])bits[i/8]|=(char)(1<<(i%8));
+            lv+=bits;
+            uint32_t ln=(uint32_t)lv.size();
+            body.append((const char*)&ln,4);
+            body+=lv;
+        }
+        body+=c.data;
+        TW h;
+        h.i32(1,0);
+        h.i32(2,(int)body.size());
+        h.i32(3,(int)body.size());
+        h.sbeg(5);
+        h.i32(1,(int)nrows);
+        h.i32(2,0);
+        h.i32(3,3);
+        h.i32(4,3);
+        h.send();
+        h.b.push_back(0);
+        offs.push_back((ll)f.size());
+        sizes.push_back((ll)(h.b.size()+body.size()));
+        f+=h.b;
+        f+=body;
+    }
+    TW m;
+    m.i32(1,1);
+    m.lst(2,12,cols.size()+1);
+    m.lbeg();m.str(4,"schema");m.i32(5,(int)cols.size());m.send();
+    for(auto&c:cols){
+        m.lbeg();
+        m.i32(1,c.type);
+        m.i32(3,c.opt?1:0);
+        m.str(4,c.name);
+        if(c.conv>=0)m.i32(6,c.conv);
+        m.send();
+    }
+    m.i64(3,nrows);
+    m.lst(4,12,1);
+    m.lbeg();
+    m.lst(1,12,cols.size());
+    ll total=0;
+    for(size_t k=0;k<cols.size();k++){
+        m.lbeg();
+        m.i64(2,offs[k]);
+        m.sbeg(3);
+        m.i32(1,cols[k].type);
+        m.lst(2,5,2);m.zz(0);m.zz(3);
+        m.lst(3,8,1);m.varint(cols[k].name.size());m.b+=cols[k].name;
+        m.i32(4,0);
+        m.i64(5,nrows);
+        m.i64(6,sizes[k]);
+        m.i64(7,sizes[k]);
+        m.i64(9,offs[k]);
+        m.send();
+        m.send();
+        total+=sizes[k];
+    }
+    m.i64(2,total);
+    m.i64(3,nrows);
+    m.send();
+    m.b.push_back(0);
+    f+=m.b;
+    uint32_t fl=(uint32_t)m.b.size();
+    f.append((const char*)&fl,4);
+    f+="PAR1";
+    FILE*fp=fopen(path.c_str(),"wb");
+    if(!fp){fprintf(stderr,"cannot write %s\n",path.c_str());exit(1);}
+    fwrite(f.data(),1,f.size(),fp);
+    fclose(fp);
+}
+
+// ---- links (single-threaded, read-only afterwards) ----
+static unordered_map<sv,uint32_t> lmap;
+static vector<sv> lnames;
 static vector<uint32_t> par;
+static uint32_t lget(sv s){
+    auto r=lmap.emplace(s,(uint32_t)lnames.size());
+    if(r.second)lnames.push_back(s);
+    return r.first->second;
+}
 static uint32_t findr(uint32_t x){
     while(par[x]!=x){
         par[x]=par[par[x]];
@@ -166,22 +312,28 @@ static uint32_t findr(uint32_t x){
     }
     return x;
 }
-static uint32_t person(sv s){
-    uint32_t i=I.get(s);
-    while(par.size()<I.names.size())par.push_back((uint32_t)par.size());
-    return findr(i);
+static inline sv resolve(sv u){
+    auto it=lmap.find(u);
+    if(it==lmap.end())return u;
+    return lnames[par[it->second]];
 }
 
-struct EvRec{sv user;ll ts;ll ing;sv prod;int type;ll price;};
-struct Ev{uint32_t p;ll ts;int32_t price;uint8_t cat;};
-struct Ck{uint32_t p;ll ts;uint32_t camp;sv id;};
+struct EvRec{sv id,user,prod;ll ts,ing,price;int type;};
+struct EvB{sv name;ll ts;int32_t price;uint8_t cat;};
+struct CkB{sv name;ll ts;uint32_t camp;sv id;};
+struct E2{uint32_t p;ll ts;int32_t price;uint8_t cat;};
+struct K2{uint32_t p;ll ts;uint32_t camp;sv id;};
 struct CA{ll s=0,ps=0,rev=0,as=0;};
+struct UdRow{sv name;int32_t day;ll s,e,r;int cat;};
+struct Out{vector<UdRow> ud;unordered_map<uint64_t,CA> cam;};
 
 int main(){
     const char*e1=getenv("DATA_DIR");
-    const char*e2=getenv("SCRATCH_DIR");
+    const char*e3=getenv("NCPU");
     string DATA=e1?e1:"/data";
-    string SCR=e2?e2:"/tmp";
+    string OUT=getenv("OUTPUT_DIR")?getenv("OUTPUT_DIR"):"/output";
+    if(e3)NT=max(1,atoi(e3));
+    else NT=max(1,(int)thread::hardware_concurrency());
 
     ll WS,WE;
     {
@@ -210,6 +362,7 @@ int main(){
     for(size_t k=0;k<catnames.size();k++)catid[catnames[k]]=(uint8_t)k;
     uint8_t unk=catid[sv("unknown")];
     unordered_map<sv,uint8_t> prodcat;
+    prodcat.reserve(prows.size()*2);
     for(auto&pr:prows)prodcat[pr.first]=catid[pr.second];
     int ncat=(int)catnames.size();
 
@@ -222,50 +375,68 @@ int main(){
     });
     uint32_t ncamp=(uint32_t)campid.size();
     uint32_t organic=ncamp;
+    lap("setup");
 
     {
         vector<pair<uint32_t,uint32_t>> edges;
         eachrow(listcsv(DATA+"/links"),2,[&](sv*f){
             if(f[0].empty()||f[1].empty())return;
-            uint32_t a=I.get(f[0]);
-            uint32_t b=I.get(f[1]);
+            uint32_t a=lget(f[0]);
+            uint32_t b=lget(f[1]);
             edges.push_back({a,b});
         });
-        while(par.size()<I.names.size())par.push_back((uint32_t)par.size());
+        par.resize(lnames.size());
+        for(size_t k=0;k<par.size();k++)par[k]=(uint32_t)k;
         for(auto&ed:edges){
             uint32_t ra=findr(ed.first);
             uint32_t rb=findr(ed.second);
             if(ra==rb)continue;
-            if(I.names[ra]<I.names[rb])par[rb]=ra;
+            if(lnames[ra]<lnames[rb])par[rb]=ra;
             else par[ra]=rb;
         }
+        for(size_t k=0;k<par.size();k++)par[k]=findr((uint32_t)k);
     }
+    lap("links");
 
-    vector<Ev> ev;
-    {
-        vector<EvRec> recs;
-        unordered_map<sv,uint32_t> eidx;
-        eachrow(listcsv(DATA+"/events"),7,[&](sv*f){
+    // ---- phase A: parallel parse events into shards ----
+    vector<Chunk> echunks;
+    addChunks(listcsv(DATA+"/events"),echunks,4<<20);
+    vector<vector<vector<EvRec>>> loc(NT,vector<vector<EvRec>>(NS));
+    pfor(echunks.size(),[&](size_t ci,int tid){
+        rows(echunks[ci],7,[&](sv*f){
             if(f[0].empty())return;
             ll ing=parse_ts(f[3]);
             if(ing==BAD)ing=LLONG_MAX;
-            auto r=eidx.emplace(f[0],(uint32_t)recs.size());
-            if(!r.second&&ing>=recs[r.first->second].ing)return;
             int type=0;
             if(f[4]=="view")type=1;
             else if(f[4]=="cart")type=2;
             else if(f[4]=="purchase")type=3;
-            EvRec rec{f[1],parse_ts(f[2]),ing,f[5],type,type==3?parse_price(f[6]):-1};
-            if(r.second)recs.push_back(rec);
-            else recs[r.first->second]=rec;
+            EvRec rec{f[0],f[1],f[5],parse_ts(f[2]),ing,type==3?parse_price(f[6]):-1,type};
+            loc[tid][shardOf(f[0],NS)].push_back(rec);
         });
-        ev.reserve(recs.size());
-        for(auto&r:recs){
+    });
+    lap("A parse events");
+
+    // ---- phase B: dedup per shard, validate, route to person buckets ----
+    vector<vector<vector<EvB>>> eb(NT,vector<vector<EvB>>(NB));
+    pfor(NS,[&](size_t s,int tid){
+        size_t tot=0;
+        for(int t=0;t<NT;t++)tot+=loc[t][s].size();
+        unordered_map<sv,uint32_t> m;
+        m.reserve(tot*2);
+        vector<const EvRec*> kept;
+        kept.reserve(tot);
+        for(int t=0;t<NT;t++)for(const EvRec&r:loc[t][s]){
+            auto it=m.emplace(r.id,(uint32_t)kept.size());
+            if(it.second)kept.push_back(&r);
+            else if(r.ing<kept[it.first->second]->ing)kept[it.first->second]=&r;
+        }
+        for(const EvRec*pr:kept){
+            const EvRec&r=*pr;
             if(r.user.empty()||r.ts==BAD||r.ts<WS||r.ts>=WE)continue;
             if(r.type==0||r.prod.empty())continue;
             if(r.type==3&&r.price<1)continue;
             if(r.ing-r.ts>DAY)continue;
-            uint32_t p=person(r.user);
             int32_t price=0;
             uint8_t cat=0;
             if(r.type==3){
@@ -273,123 +444,188 @@ int main(){
                 auto it=prodcat.find(r.prod);
                 cat=it==prodcat.end()?unk:it->second;
             }
-            ev.push_back({p,r.ts,price,cat});
+            sv name=resolve(r.user);
+            eb[tid][shardOf(name,NB)].push_back({name,r.ts,price,cat});
         }
-    }
-    sort(ev.begin(),ev.end(),[](const Ev&a,const Ev&b){
-        if(a.p!=b.p)return a.p<b.p;
-        return a.ts<b.ts;
+    });
+    lap("B dedup+route");
+
+    // ---- clicks: parallel parse and route ----
+    vector<Chunk> cchunks;
+    addChunks(listcsv(DATA+"/clicks"),cchunks,4<<20);
+    vector<vector<vector<CkB>>> cb(NT,vector<vector<CkB>>(NB));
+    pfor(cchunks.size(),[&](size_t ci,int tid){
+        rows(cchunks[ci],4,[&](sv*f){
+            if(f[0].empty()||f[1].empty())return;
+            auto c=campidx.find(f[2]);
+            if(c==campidx.end())return;
+            ll ts=parse_ts(f[3]);
+            if(ts==BAD||ts<WS-WEEK||ts>=WE)return;
+            sv name=resolve(f[1]);
+            cb[tid][shardOf(name,NB)].push_back({name,ts,c->second,f[0]});
+        });
+    });
+    lap("clicks");
+
+    // ---- phase C: per bucket sort + sweep ----
+    vector<Out> outs(NB);
+    pfor(NB,[&](size_t b,int){
+        unordered_map<sv,uint32_t> pl;
+        vector<sv> nm;
+        auto pid=[&](sv s){
+            auto r=pl.emplace(s,(uint32_t)nm.size());
+            if(r.second)nm.push_back(s);
+            return r.first->second;
+        };
+        size_t n=0;
+        for(int t=0;t<NT;t++)n+=eb[t][b].size();
+        vector<E2> ev;
+        ev.reserve(n);
+        for(int t=0;t<NT;t++)for(const EvB&x:eb[t][b])ev.push_back({pid(x.name),x.ts,x.price,x.cat});
+        size_t nc=0;
+        for(int t=0;t<NT;t++)nc+=cb[t][b].size();
+        vector<K2> ck;
+        ck.reserve(nc);
+        for(int t=0;t<NT;t++)for(const CkB&x:cb[t][b])ck.push_back({pid(x.name),x.ts,x.camp,x.id});
+        sort(ev.begin(),ev.end(),[](const E2&a,const E2&c){
+            if(a.p!=c.p)return a.p<c.p;
+            return a.ts<c.ts;
+        });
+        sort(ck.begin(),ck.end(),[](const K2&a,const K2&c){
+            if(a.p!=c.p)return a.p<c.p;
+            if(a.ts!=c.ts)return a.ts<c.ts;
+            return a.id<c.id;
+        });
+
+        Out&o=outs[b];
+        vector<int> cnt(ncamp+1,0),pos(ncamp+1,0);
+        vector<uint32_t> active;
+        auto addc=[&](uint32_t c){
+            if(cnt[c]++==0){pos[c]=(int)active.size();active.push_back(c);}
+        };
+        auto remc=[&](uint32_t c){
+            if(--cnt[c]==0){
+                uint32_t last=active.back();
+                active[pos[c]]=last;
+                pos[last]=pos[c];
+                active.pop_back();
+            }
+        };
+        auto key=[](uint32_t c,ll day){return ((uint64_t)c<<32)|(uint64_t)day;};
+        vector<ll> daycat(ncat,0);
+        ll curday=-1,dsess=0,devs=0,drev=0;
+        auto flush=[&](uint32_t p){
+            if(curday<0)return;
+            int best=-1;
+            ll mx=0;
+            for(int k=0;k<ncat;k++)if(daycat[k]>mx){mx=daycat[k];best=k;}
+            o.ud.push_back({nm[p],(int32_t)curday,(ll)dsess,(ll)devs,(ll)drev,best});
+            fill(daycat.begin(),daycat.end(),0);
+            curday=-1;dsess=0;devs=0;drev=0;
+        };
+
+        size_t cbp=0,i=0;
+        while(i<ev.size()){
+            uint32_t p=ev[i].p;
+            size_t ie=i;
+            while(ie<ev.size()&&ev[ie].p==p)ie++;
+            while(cbp<ck.size()&&ck[cbp].p<p)cbp++;
+            size_t ce=cbp;
+            while(ce<ck.size()&&ck[ce].p==p)ce++;
+            size_t lo=cbp,hi=cbp;
+            size_t e=i;
+            while(e<ie){
+                ll s=ev[e].ts;
+                ll day=s/DAY;
+                if(day!=curday){flush(p);curday=day;}
+                ll prev=s,rev=0;
+                bool hp=false;
+                size_t f=e;
+                while(f<ie&&ev[f].ts-prev<=GAP){
+                    prev=ev[f].ts;
+                    if(ev[f].price){rev+=ev[f].price;hp=true;daycat[ev[f].cat]+=ev[f].price;}
+                    f++;
+                }
+                dsess++;devs+=(ll)(f-e);drev+=rev;
+                while(hi<ce&&ck[hi].ts<=s){addc(ck[hi].camp);hi++;}
+                while(lo<hi&&ck[lo].ts<s-WEEK){remc(ck[lo].camp);lo++;}
+                uint32_t camp=organic;
+                if(lo<hi){
+                    size_t last=hi-1,j=last;
+                    while(j>lo&&ck[j-1].ts==ck[last].ts)j--;
+                    camp=ck[j].camp;
+                }
+                CA&a=o.cam[key(camp,day)];
+                a.s++;
+                if(hp)a.ps++;
+                a.rev+=rev;
+                for(uint32_t c:active)o.cam[key(c,day)].as++;
+                e=f;
+            }
+            flush(p);
+            for(size_t k=lo;k<hi;k++)remc(ck[k].camp);
+            cbp=ce;
+            i=ie;
+        }
+    });
+    lap("C sort+sweep");
+
+    // ---- output: write Parquet directly ----
+    mkdir(OUT.c_str(),0755);
+    mkdir((OUT+"/user_daily").c_str(),0755);
+    mkdir((OUT+"/campaign_daily").c_str(),0755);
+
+    thread tu([&]{
+        vector<Col> c(6);
+        c[0]={"user_id",6,0,false};
+        c[1]={"day",1,6,false};
+        c[2]={"sessions",2,-1,false};
+        c[3]={"events",2,-1,false};
+        c[4]={"revenue_cents",2,-1,false};
+        c[5]={"top_category",6,0,true};
+        ll n=0;
+        for(auto&o:outs)for(const UdRow&r:o.ud){
+            c[0].as(r.name);
+            c[1].a32(r.day);
+            c[2].a64(r.s);
+            c[3].a64(r.e);
+            c[4].a64(r.r);
+            if(r.cat>=0){c[5].as(catnames[r.cat]);c[5].defd.push_back(1);}
+            else c[5].defd.push_back(0);
+            n++;
+        }
+        writeParquet(OUT+"/user_daily/part-0.parquet",c,n);
     });
 
-    vector<Ck> ck;
-    eachrow(listcsv(DATA+"/clicks"),4,[&](sv*f){
-        if(f[0].empty()||f[1].empty())return;
-        auto c=campidx.find(f[2]);
-        if(c==campidx.end())return;
-        ll ts=parse_ts(f[3]);
-        if(ts==BAD||ts<WS-WEEK||ts>=WE)return;
-        ck.push_back({person(f[1]),ts,c->second,f[0]});
-    });
-    sort(ck.begin(),ck.end(),[](const Ck&a,const Ck&b){
-        if(a.p!=b.p)return a.p<b.p;
-        if(a.ts!=b.ts)return a.ts<b.ts;
-        return a.id<b.id;
-    });
-
-    FILE*fu=fopen((SCR+"/ud.txt").c_str(),"wb");
-    static char fbuf[1<<20];
-    setvbuf(fu,fbuf,_IOFBF,sizeof fbuf);
     unordered_map<uint64_t,CA> cam;
-    vector<int> cnt(ncamp+1,0),pos(ncamp+1,0);
-    vector<uint32_t> active;
-    auto addc=[&](uint32_t c){
-        if(cnt[c]++==0){pos[c]=(int)active.size();active.push_back(c);}
-    };
-    auto remc=[&](uint32_t c){
-        if(--cnt[c]==0){
-            uint32_t last=active.back();
-            active[pos[c]]=last;
-            pos[last]=pos[c];
-            active.pop_back();
-        }
-    };
-    auto key=[](uint32_t c,ll day){return ((uint64_t)c<<32)|(uint64_t)day;};
-
-    vector<ll> daycat(ncat,0);
-    ll curday=-1,dsess=0,devs=0,drev=0;
-    auto flush=[&](uint32_t p){
-        if(curday<0)return;
-        int best=-1;
-        ll mx=0;
-        for(int k=0;k<ncat;k++)if(daycat[k]>mx){mx=daycat[k];best=k;}
-        int y,m,d;
-        civil(curday,y,m,d);
-        string nm(I.names[p]);
-        for(char&c:nm)if(c=='\r')c=2;
-        fprintf(fu,"%s\x01%04d-%02d-%02d\x01%lld\x01%lld\x01%lld\x01",nm.c_str(),y,m,d,dsess,devs,drev);
-        if(best>=0)fwrite(catnames[best].data(),1,catnames[best].size(),fu);
-        fputc('\n',fu);
-        fill(daycat.begin(),daycat.end(),0);
-        curday=-1;dsess=0;devs=0;drev=0;
-    };
-
-    size_t cb=0;
-    size_t i=0;
-    while(i<ev.size()){
-        uint32_t p=ev[i].p;
-        size_t ie=i;
-        while(ie<ev.size()&&ev[ie].p==p)ie++;
-        while(cb<ck.size()&&ck[cb].p<p)cb++;
-        size_t ce=cb;
-        while(ce<ck.size()&&ck[ce].p==p)ce++;
-        size_t lo=cb,hi=cb;
-        size_t e=i;
-        while(e<ie){
-            ll s=ev[e].ts;
-            ll day=s/DAY;
-            if(day!=curday){flush(p);curday=day;}
-            ll prev=s,rev=0;
-            bool hp=false;
-            size_t f=e;
-            while(f<ie&&ev[f].ts-prev<=GAP){
-                prev=ev[f].ts;
-                if(ev[f].price){rev+=ev[f].price;hp=true;daycat[ev[f].cat]+=ev[f].price;}
-                f++;
-            }
-            dsess++;devs+=(ll)(f-e);drev+=rev;
-            while(hi<ce&&ck[hi].ts<=s){addc(ck[hi].camp);hi++;}
-            while(lo<hi&&ck[lo].ts<s-WEEK){remc(ck[lo].camp);lo++;}
-            uint32_t camp=organic;
-            if(lo<hi){
-                size_t last=hi-1,j=last;
-                while(j>lo&&ck[j-1].ts==ck[last].ts)j--;
-                camp=ck[j].camp;
-            }
-            CA&a=cam[key(camp,day)];
-            a.s++;
-            if(hp)a.ps++;
-            a.rev+=rev;
-            for(uint32_t c:active)cam[key(c,day)].as++;
-            e=f;
-        }
-        flush(p);
-        for(size_t k=lo;k<hi;k++)remc(ck[k].camp);
-        cb=ce;
-        i=ie;
+    for(auto&o:outs)for(auto&kv:o.cam){
+        CA&a=cam[kv.first];
+        a.s+=kv.second.s;a.ps+=kv.second.ps;a.rev+=kv.second.rev;a.as+=kv.second.as;
     }
-    fclose(fu);
-
-    FILE*fc=fopen((SCR+"/cd.txt").c_str(),"wb");
-    for(auto&kv:cam){
-        uint32_t c=(uint32_t)(kv.first>>32);
-        ll day=(ll)(kv.first&0xffffffffULL);
-        int y,m,d;
-        civil(day,y,m,d);
-        string id=c==organic?"organic":string(campid[c]);
-        string ch=c==organic?"organic":string(campch[c]);
-        fprintf(fc,"%s\x01%s\x01%04d-%02d-%02d\x01%lld\x01%lld\x01%lld\x01%lld\n",
-            id.c_str(),ch.c_str(),y,m,d,kv.second.s,kv.second.ps,kv.second.rev,kv.second.as);
+    {
+        vector<Col> c(7);
+        c[0]={"campaign_id",6,0,false};
+        c[1]={"channel",6,0,false};
+        c[2]={"day",1,6,false};
+        c[3]={"sessions",2,-1,false};
+        c[4]={"purchasing_sessions",2,-1,false};
+        c[5]={"revenue_cents",2,-1,false};
+        c[6]={"assisted_sessions",2,-1,false};
+        ll n=0;
+        for(auto&kv:cam){
+            uint32_t k=(uint32_t)(kv.first>>32);
+            c[0].as(k==organic?sv("organic"):campid[k]);
+            c[1].as(k==organic?sv("organic"):campch[k]);
+            c[2].a32((int32_t)(kv.first&0xffffffffULL));
+            c[3].a64(kv.second.s);
+            c[4].a64(kv.second.ps);
+            c[5].a64(kv.second.rev);
+            c[6].a64(kv.second.as);
+            n++;
+        }
+        writeParquet(OUT+"/campaign_daily/part-0.parquet",c,n);
     }
-    fclose(fc);
+    tu.join();
+    lap("write");
     return 0;
 }
