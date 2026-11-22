@@ -32,3 +32,8 @@ perf.data*
 prof_flat.txt
 outb/
 outp/
+pipeline/s_*
+perf.data*
+prof_flat.txt
+outb/
+outp/

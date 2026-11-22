@@ -1,4 +1,5 @@
 #include <bits/stdc++.h>
+#include <immintrin.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -7,16 +8,22 @@
 using namespace std;
 typedef string_view sv;
 typedef long long ll;
+typedef unsigned __int128 u128;
+
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
 
 static const ll BAD=LLONG_MIN;
 static const ll DAY=86400000LL;
 static const ll WEEK=7*DAY;
 static const ll GAP=1800000LL;
-static const int NS=256;
+static const int NS=1024;
 static const int NB=256;
 static int NT=8;
 static ll D0;
 static int ND;
+static atomic<bool> gPop(true);
 
 static double nowt(){timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9;}
 static double TL=nowt();
@@ -37,9 +44,26 @@ template<class F> static void pfor(size_t n,F f){
     for(auto&x:th)x.join();
 }
 
+// All callers pass views into mmapped input (which has a zero slack page after it),
+// so reading 16 bytes from the start of a short string is safe.
 static inline uint64_t hsh(sv s){
-    const char*p=s.data();
     size_t n=s.size();
+    const char*p=s.data();
+    if(n<=16){
+        uint64_t a,b;
+        memcpy(&a,p,8);
+        memcpy(&b,p+8,8);
+        uint64_t ma=n>=8?~0ULL:((1ULL<<(8*(n&7)))-1);
+        uint64_t mb=n>=16?~0ULL:(n>8?((1ULL<<(8*(n-8)))-1):0ULL);
+        a&=ma;b&=mb;
+        uint64_t h=(a^((uint64_t)n*0x9E3779B97F4A7C15ULL))*0xff51afd7ed558ccdULL;
+        h^=h>>32;
+        h=(h^b)*0xc4ceb9fe1a85ec53ULL;
+        h^=h>>29;
+        h*=0x9E3779B97F4A7C15ULL;
+        h^=h>>32;
+        return h;
+    }
     uint64_t h=0x9E3779B97F4A7C15ULL^(uint64_t)n;
     while(n>=8){
         uint64_t v;
@@ -167,6 +191,7 @@ static vector<string> listcsv(const string&dir){
 
 struct Chunk{const char*b;const char*e;};
 
+// Maps each file followed by anonymous zero pages, so reads a little past the end are safe.
 static void addChunks(const vector<string>&paths,vector<Chunk>&out,size_t CH){
     for(const string&path:paths){
         int fd=open(path.c_str(),O_RDONLY);
@@ -174,10 +199,15 @@ static void addChunks(const vector<string>&paths,vector<Chunk>&out,size_t CH){
         struct stat st;
         fstat(fd,&st);
         if(st.st_size==0){close(fd);continue;}
-        const char*p=(const char*)mmap(0,st.st_size,PROT_READ,MAP_PRIVATE,fd,0);
+        size_t len=(size_t)st.st_size;
+        size_t maplen=(len+4095)&~(size_t)4095;
+        char*base=(char*)mmap(0,maplen+8192,PROT_READ,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+        if(base==(char*)MAP_FAILED){close(fd);continue;}
+        void*r=mmap(base,len,PROT_READ,MAP_PRIVATE|MAP_FIXED,fd,0);
         close(fd);
-        if(p==MAP_FAILED)continue;
-        const char*e=p+st.st_size;
+        if(r==MAP_FAILED){munmap(base,maplen+8192);continue;}
+        const char*p=base;
+        const char*e=p+len;
         const char*nl=(const char*)memchr(p,'\n',e-p);
         if(!nl)continue;
         const char*s=nl+1;
@@ -210,7 +240,27 @@ static size_t estRows(const vector<Chunk>&cs){
     return sb?(size_t)((double)tb/(double)sb*(double)sl):0;
 }
 
-// Single-pass line parser. Same semantics as: split on commas, strip one pair of
+// ---------------- line parsing ----------------
+
+// bytes equal to pat get their high bit set (lowest set bit is exact)
+static inline uint64_t hasb(uint64_t x,uint64_t pat){
+    uint64_t v=x^pat;
+    return (v-0x0101010101010101ULL)&~v&0x8080808080808080ULL;
+}
+// first of ',', '"', '\n' at or after p (or e)
+static inline const char* scan3(const char*p,const char*e){
+    while(p+8<=e){
+        uint64_t x;
+        memcpy(&x,p,8);
+        uint64_t m=hasb(x,0x2C2C2C2C2C2C2C2CULL)|hasb(x,0x2222222222222222ULL)|hasb(x,0x0A0A0A0A0A0A0A0AULL);
+        if(m)return p+(__builtin_ctzll(m)>>3);
+        p+=8;
+    }
+    while(p<e&&*p!=','&&*p!='\n'&&*p!='"')p++;
+    return p;
+}
+
+// Generic single-pass line parser. Semantics: split on commas, strip one pair of
 // surrounding quotes, reject any other quote, require exactly nc fields.
 // Always sets next to the start of the following line.
 static inline bool parseLine(const char*p,const char*e,int nc,sv*out,const char*&next){
@@ -220,14 +270,14 @@ static inline bool parseLine(const char*p,const char*e,int nc,sv*out,const char*
         if(p<e&&*p=='"'){
             p++;
             const char*s=p;
-            while(p<e&&*p!='"'&&*p!=','&&*p!='\n')p++;
+            p=scan3(p,e);
             if(p>=e||*p!='"')goto bad;
             out[k++]=sv(s,(size_t)(p-s));
             p++;
             if(p<e&&*p!=','&&*p!='\n')goto bad;
         }else{
             const char*s=p;
-            while(p<e&&*p!=','&&*p!='\n'&&*p!='"')p++;
+            p=scan3(p,e);
             if(p<e&&*p=='"')goto bad;
             out[k++]=sv(s,(size_t)(p-s));
         }
@@ -243,13 +293,82 @@ bad:
     }
 }
 
+static inline int ctz128(u128 x){
+    uint64_t lo=(uint64_t)x;
+    return lo?__builtin_ctzll(lo):64+__builtin_ctzll((uint64_t)(x>>64));
+}
+static inline int pop128(u128 x){
+    return __builtin_popcountll((uint64_t)x)+__builtin_popcountll((uint64_t)(x>>64));
+}
+// masks of ',' '"' '\n' over the 128 bytes starting at p (bit i = byte i)
+static inline void scan128(const char*p,u128&cm,u128&qm,u128&nm){
+    const __m256i vc=_mm256_set1_epi8(',');
+    const __m256i vq=_mm256_set1_epi8('"');
+    const __m256i vn=_mm256_set1_epi8('\n');
+    uint64_t c[2],q[2],n[2];
+    for(int h=0;h<2;h++){
+        __m256i a=_mm256_loadu_si256((const __m256i*)(p+64*h));
+        __m256i b=_mm256_loadu_si256((const __m256i*)(p+64*h+32));
+        c[h]=(uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a,vc))
+            |((uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b,vc))<<32);
+        q[h]=(uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a,vq))
+            |((uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b,vq))<<32);
+        n[h]=(uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a,vn))
+            |((uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b,vn))<<32);
+    }
+    cm=((u128)c[1]<<64)|c[0];
+    qm=((u128)q[1]<<64)|q[0];
+    nm=((u128)n[1]<<64)|n[0];
+}
+
+// Fast path: handles lines of up to 127 bytes. Returns false (without side effects that
+// matter) for anything unusual; the caller then uses the generic parser, so semantics
+// are identical either way.
+static inline bool fastLine(const char*p,int nc,sv*out,const char*&next){
+    u128 cm,qm,nm;
+    scan128(p,cm,qm,nm);
+    if(!nm)return false;
+    int L=ctz128(nm);
+    u128 lim=(((u128)1)<<L)-1;
+    cm&=lim;
+    qm&=lim;
+    if(pop128(cm)!=nc-1)return false;
+    int s[8],en[8];
+    s[0]=0;
+    u128 m=cm;
+    for(int k=0;k<nc-1;k++){
+        int c=ctz128(m);
+        m&=m-1;
+        en[k]=c;
+        s[k+1]=c+1;
+    }
+    en[nc-1]=L;
+    int nq=0;
+    bool ok=true;
+    for(int k=0;k<nc;k++){
+        int a=s[k],b=en[k];
+        if(b>a&&(int)((qm>>a)&1)){
+            ok=ok&&(b-a>=2)&&(int)((qm>>(b-1))&1);
+            nq+=2;
+            out[k]=sv(p+a+1,(size_t)(b-a>=2?b-a-2:0));
+        }else{
+            out[k]=sv(p+a,(size_t)(b-a));
+        }
+    }
+    if(!ok||pop128(qm)!=nq)return false;
+    next=p+L+1;
+    return true;
+}
+
 template<class F> static void rows(const Chunk&ch,int nc,F f){
     const char*p=ch.b;
     const char*e=ch.e;
     sv fields[8];
     while(p<e){
         const char*next;
-        if(parseLine(p,e,nc,fields,next))f(fields);
+        bool ok=fastLine(p,nc,fields,next);
+        if(!ok)ok=parseLine(p,e,nc,fields,next);
+        if(ok)f(fields);
         p=next;
     }
 }
@@ -275,21 +394,10 @@ static ll days_from_civil(ll y,int m,int d){
     return era*146097+doe-719468;
 }
 
-static ll parse_ts(sv s){
-    size_t n=s.size();
-    if(n==0)return BAD;
-    bool all=true;
-    for(size_t k=0;k<n;k++)if(!dg(s[k])){all=false;break;}
-    if(all){
-        size_t k=0;
-        while(k<n-1&&s[k]=='0')k++;
-        if(n-k>18)return BAD;
-        ll v=0;
-        for(;k<n;k++)v=v*10+(s[k]-'0');
-        return v;
-    }
-    if(n!=20&&n!=25)return BAD;
-    const char*p=s.data();
+struct DC{uint64_t k0;uint16_t k1;bool v;ll days;};
+
+// n is 20 or 25 and p[4]=='-' (so it cannot be an all-digit string)
+static ll parse_iso(const char*p,size_t n){
     if(p[4]!='-'||p[7]!='-'||p[10]!='T'||p[13]!=':'||p[16]!=':')return BAD;
     int pos[]={0,1,2,3,5,6,8,9,11,12,14,15,17,18};
     for(int k=0;k<14;k++)if(!dg(p[pos[k]]))return BAD;
@@ -305,14 +413,43 @@ static ll parse_ts(sv s){
         if(oh>23||om>59)return BAD;
         off=(oh*3600000LL+om*60000LL)*(p[19]=='-'?-1:1);
     }
-    int y=num(p,4),mo=num(p+5,2),d=num(p+8,2),h=num(p+11,2),mi=num(p+14,2),se=num(p+17,2);
-    if(mo<1||mo>12||d<1||h>23||mi>59||se>59)return BAD;
-    static const int dim[]={31,28,31,30,31,30,31,31,30,31,30,31};
-    int mx=dim[mo-1];
-    if(mo==2&&((y%4==0&&y%100!=0)||y%400==0))mx=29;
-    if(d>mx)return BAD;
-    ll days=days_from_civil(y,mo,d);
+    int h=num(p+11,2),mi=num(p+14,2),se=num(p+17,2);
+    if(h>23||mi>59||se>59)return BAD;
+    // date part, cached per thread (only valid dates are cached)
+    static thread_local DC dcache[32];
+    uint64_t k0;
+    uint16_t k1;
+    memcpy(&k0,p,8);
+    memcpy(&k1,p+8,2);
+    DC&c=dcache[((p[8]-'0')*10+(p[9]-'0'))&31];
+    ll days;
+    if(c.v&&c.k0==k0&&c.k1==k1){
+        days=c.days;
+    }else{
+        int y=num(p,4),mo=num(p+5,2),d=num(p+8,2);
+        if(mo<1||mo>12||d<1)return BAD;
+        static const int dim[]={31,28,31,30,31,30,31,31,30,31,30,31};
+        int mx=dim[mo-1];
+        if(mo==2&&((y%4==0&&y%100!=0)||y%400==0))mx=29;
+        if(d>mx)return BAD;
+        days=days_from_civil(y,mo,d);
+        c.k0=k0;c.k1=k1;c.v=true;c.days=days;
+    }
     return ((days*86400LL+h*3600LL+mi*60LL+se)*1000LL)-off;
+}
+
+static ll parse_ts(sv s){
+    size_t n=s.size();
+    const char*p=s.data();
+    if((n==20||n==25)&&p[4]=='-')return parse_iso(p,n);
+    if(n==0)return BAD;
+    for(size_t k=0;k<n;k++)if(!dg(p[k]))return BAD;
+    size_t k=0;
+    while(k<n-1&&p[k]=='0')k++;
+    if(n-k>18)return BAD;
+    ll v=0;
+    for(;k<n;k++)v=v*10+(p[k]-'0');
+    return v;
 }
 
 static ll parse_price(sv s){
@@ -474,7 +611,27 @@ struct K3{ll ts;uint32_t camp;sv id;};
 struct CA{ll s=0,ps=0,rev=0,as=0;};
 struct UdRow{sv name;int32_t day;ll s,e,r;int cat;};
 struct Out{vector<UdRow> ud;};
-struct Slot{uint64_t h;uint32_t idx;};
+struct Scr{
+    vector<uint32_t> pe,pc,es,cs,ep,cp;
+    vector<E3> ev;
+    vector<K3> ck;
+};
+
+// fault the pages of a freshly reserved buffer in bulk (cheaper than one fault per page)
+static inline void prefault(void*p,size_t bytes){
+    if(!gPop.load(std::memory_order_relaxed))return;
+    uintptr_t a=((uintptr_t)p+4095)&~(uintptr_t)4095;
+    uintptr_t b=((uintptr_t)p+bytes)&~(uintptr_t)4095;
+    if(b>a&&madvise((void*)a,b-a,MADV_POPULATE_WRITE)!=0)gPop.store(false,std::memory_order_relaxed);
+}
+
+template<class V,class T> static inline void pushR(V&v,const T&x,size_t per){
+    if(v.capacity()==0){
+        v.reserve(per);
+        prefault((void*)v.data(),v.capacity()*sizeof(T));
+    }
+    v.push_back(x);
+}
 
 template<class T,class C> static inline void sortRange(T*a,size_t m,C cmp){
     if(m<2)return;
@@ -555,14 +712,24 @@ int main(){
     vector<Chunk> echunks;
     addChunks(listcsv(DATA+"/events"),echunks,4<<20);
     size_t estE=estRows(echunks);
+    size_t perLoc=estE/((size_t)NT*NS)*5/4+32;
+    size_t perEb=estE/((size_t)NT*NB)*5/4+32;
     vector<vector<vector<EvRec>>> loc(NT,vector<vector<EvRec>>(NS));
-    {
-        size_t per=estE/((size_t)NT*NS)*3/2+32;
-        for(int t=0;t<NT;t++)for(int s=0;s<NS;s++)loc[t][s].reserve(per);
+
+    size_t lbytes=0;
+    for(auto&pth:listcsv(DATA+"/links")){
+        struct stat st;
+        if(stat(pth.c_str(),&st)==0)lbytes+=(size_t)st.st_size;
     }
 
+    double tStart=nowt();
+    double tLinks=0,tA=0;
     thread lt([&]{
+        size_t wantL=lbytes/21*2+16;
+        lm.init(wantL);
+        lm.keys.reserve(wantL);
         vector<pair<uint32_t,uint32_t>> edges;
+        edges.reserve(lbytes/21+16);
         eachrow(listcsv(DATA+"/links"),2,[&](sv*f){
             if(f[0].empty()||f[1].empty())return;
             uint32_t a=lget(f[0]);
@@ -584,6 +751,7 @@ int main(){
             sv nm=lm.keys[par[k]];
             root[k]={nm,hsh(nm)};
         }
+        tLinks=nowt()-tStart;
     });
 
     // ---- phase A: parallel parse events into shards ----
@@ -611,44 +779,49 @@ int main(){
             }
             r.type=type;
             r.pe=f[5].empty()?1:0;
-            loc[tid][shardH(r.h,NS)].push_back(r);
+            pushR(loc[tid][shardH(r.h,NS)],r,perLoc);
         });
     });
+    tA=nowt()-tStart;
     lt.join();
     lap("links+A");
+    fprintf(stderr,"  probe: A finished at %.2fs, links thread at %.2fs (since A start)\n",tA,tLinks);
 
     // ---- phase B: dedup per shard, validate, route to person buckets ----
     vector<vector<vector<EvB>>> eb(NT,vector<vector<EvB>>(NB));
-    {
-        size_t per=estE/((size_t)NT*NB)*3/2+32;
-        for(int t=0;t<NT;t++)for(int b=0;b<NB;b++)eb[t][b].reserve(per);
-    }
+    vector<vector<uint64_t>> tabs(NT);
+    vector<vector<const EvRec*>> keptv(NT);
     pfor(NS,[&](size_t s,int tid){
         size_t tot=0;
         for(int t=0;t<NT;t++)tot+=loc[t][s].size();
         size_t cap=16;
         while(cap<tot*2)cap<<=1;
         size_t mask=cap-1;
-        vector<Slot> tab(cap,Slot{0,0});
-        vector<const EvRec*> kept;
+        vector<uint64_t>&tab=tabs[tid];
+        if(tab.size()<cap)tab.resize(cap);
+        memset(tab.data(),0,cap*sizeof(uint64_t));
+        vector<const EvRec*>&kept=keptv[tid];
+        kept.clear();
         kept.reserve(tot);
         for(int t=0;t<NT;t++)for(const EvRec&r:loc[t][s]){
+            uint64_t tagv=(r.h>>32)<<32;
             size_t i=r.h&mask;
-            bool found=false;
-            while(tab[i].idx){
-                if(tab[i].h==r.h){
-                    const EvRec*k=kept[tab[i].idx-1];
-                    if(sv(k->idp,k->idl)==sv(r.idp,r.idl)){
-                        if(r.ing<k->ing)kept[tab[i].idx-1]=&r;
-                        found=true;
+            for(;;){
+                uint64_t sl=tab[i];
+                uint32_t idx=(uint32_t)sl;
+                if(!idx){
+                    kept.push_back(&r);
+                    tab[i]=tagv|(uint32_t)kept.size();
+                    break;
+                }
+                if((sl&0xFFFFFFFF00000000ULL)==tagv){
+                    const EvRec*k=kept[idx-1];
+                    if(k->h==r.h&&sv(k->idp,k->idl)==sv(r.idp,r.idl)){
+                        if(r.ing<k->ing)kept[idx-1]=&r;
                         break;
                     }
                 }
                 i=(i+1)&mask;
-            }
-            if(!found){
-                kept.push_back(&r);
-                tab[i]=Slot{r.h,(uint32_t)kept.size()};
             }
         }
         const size_t PF=8;
@@ -672,7 +845,7 @@ int main(){
                 name=root[li].name;
                 nh=root[li].h;
             }
-            eb[tid][shardH(nh,NB)].push_back({name,nh,r.ts,price,cat});
+            pushR(eb[tid][shardH(nh,NB)],EvB{name,nh,r.ts,price,cat},perEb);
         }
     });
     lap("B dedup+route");
@@ -681,11 +854,7 @@ int main(){
     vector<Chunk> cchunks;
     addChunks(listcsv(DATA+"/clicks"),cchunks,4<<20);
     vector<vector<vector<CkB>>> cb(NT,vector<vector<CkB>>(NB));
-    {
-        size_t estC=estRows(cchunks);
-        size_t per=estC/((size_t)NT*NB)*3/2+32;
-        for(int t=0;t<NT;t++)for(int b=0;b<NB;b++)cb[t][b].reserve(per);
-    }
+    size_t perCb=estRows(cchunks)/((size_t)NT*NB)*5/4+32;
     pfor(cchunks.size(),[&](size_t ci,int tid){
         rows(cchunks[ci],4,[&](sv*f){
             if(f[0].empty()||f[1].empty())return;
@@ -700,7 +869,7 @@ int main(){
                 name=root[li].name;
                 nh=root[li].h;
             }
-            cb[tid][shardH(nh,NB)].push_back({name,nh,ts,c,f[0]});
+            pushR(cb[tid][shardH(nh,NB)],CkB{name,nh,ts,c,f[0]},perCb);
         });
     });
     lap("clicks");
@@ -708,12 +877,17 @@ int main(){
     // ---- phase C: per bucket group by person (counting sort) + sweep ----
     vector<Out> outs(NB);
     vector<vector<CA>> tcam(NT,vector<CA>((size_t)(ncamp+1)*ND));
+    vector<Scr> scr(NT);
     pfor(NB,[&](size_t b,int tid){
         CA*cam=tcam[tid].data();
+        Scr&S=scr[tid];
         HM pl;
         size_t n=0,nc=0;
         for(int t=0;t<NT;t++){n+=eb[t][b].size();nc+=cb[t][b].size();}
-        vector<uint32_t> pe_(n),pc_(nc);
+        S.pe.resize(n);
+        S.pc.resize(nc);
+        vector<uint32_t>&pe_=S.pe;
+        vector<uint32_t>&pc_=S.pc;
         {
             size_t k=0;
             for(int t=0;t<NT;t++)for(const EvB&x:eb[t][b])pe_[k++]=pl.add(x.nh,x.name);
@@ -721,18 +895,24 @@ int main(){
             for(int t=0;t<NT;t++)for(const CkB&x:cb[t][b])pc_[k++]=pl.add(x.nh,x.name);
         }
         uint32_t np=(uint32_t)pl.names.size();
-        vector<uint32_t> es(np+1,0),cs(np+1,0);
+        S.es.assign(np+1,0);
+        S.cs.assign(np+1,0);
+        vector<uint32_t>&es=S.es;
+        vector<uint32_t>&cs=S.cs;
         for(size_t k=0;k<n;k++)es[pe_[k]+1]++;
         for(size_t k=0;k<nc;k++)cs[pc_[k]+1]++;
         for(uint32_t p=0;p<np;p++){es[p+1]+=es[p];cs[p+1]+=cs[p];}
-        vector<E3> ev(n);
-        vector<K3> ck(nc);
+        S.ev.resize(n);
+        S.ck.resize(nc);
+        vector<E3>&ev=S.ev;
+        vector<K3>&ck=S.ck;
         {
-            vector<uint32_t> ep(es.begin(),es.end()-1),cp(cs.begin(),cs.end()-1);
+            S.ep.assign(es.begin(),es.end()-1);
+            S.cp.assign(cs.begin(),cs.end()-1);
             size_t k=0;
-            for(int t=0;t<NT;t++)for(const EvB&x:eb[t][b])ev[ep[pe_[k++]]++]=E3{x.ts,x.price,x.cat};
+            for(int t=0;t<NT;t++)for(const EvB&x:eb[t][b])ev[S.ep[pe_[k++]]++]=E3{x.ts,x.price,x.cat};
             k=0;
-            for(int t=0;t<NT;t++)for(const CkB&x:cb[t][b])ck[cp[pc_[k++]]++]=K3{x.ts,x.camp,x.id};
+            for(int t=0;t<NT;t++)for(const CkB&x:cb[t][b])ck[S.cp[pc_[k++]]++]=K3{x.ts,x.camp,x.id};
         }
         for(uint32_t p=0;p<np;p++){
             sortRange(ev.data()+es[p],es[p+1]-es[p],[](const E3&a,const E3&c){return a.ts<c.ts;});
