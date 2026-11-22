@@ -27,3 +27,8 @@ out20/
 out20ref/
 pipeline/sessions
 pipeline/sessions_old
+pipeline/s_*
+perf.data*
+prof_flat.txt
+outb/
+outp/

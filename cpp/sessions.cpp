@@ -4,11 +4,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
-#include <malloc.h>
 using namespace std;
 typedef string_view sv;
 typedef long long ll;
- 
+
 static const ll BAD=LLONG_MIN;
 static const ll DAY=86400000LL;
 static const ll WEEK=7*DAY;
@@ -18,11 +17,11 @@ static const int NB=256;
 static int NT=8;
 static ll D0;
 static int ND;
- 
+
 static double nowt(){timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9;}
 static double TL=nowt();
 static void lap(const char*n){double t=nowt();fprintf(stderr,"%s: %.2fs\n",n,t-TL);TL=t;}
- 
+
 template<class F> static void pfor(size_t n,F f){
     atomic<size_t> nx(0);
     auto w=[&](int tid){
@@ -37,7 +36,7 @@ template<class F> static void pfor(size_t n,F f){
     w(0);
     for(auto&x:th)x.join();
 }
- 
+
 static inline uint64_t hsh(sv s){
     const char*p=s.data();
     size_t n=s.size();
@@ -60,13 +59,14 @@ static inline uint64_t hsh(sv s){
     return h;
 }
 static inline int shardH(uint64_t h,int n){return (int)((h>>40)%(uint64_t)n);}
- 
+
 // flat open-addressing map from string to dense index (hash+index interleaved)
 struct FM{
     struct Sl{uint64_t h;uint32_t i;};
     vector<Sl> t;
     vector<sv> keys;
     size_t mask=0;
+    bool collide=false; // two different keys share a 64-bit hash
     FM(){init(8);}
     void init(size_t want){
         size_t c=16;
@@ -82,11 +82,23 @@ struct FM{
         }
         return UINT32_MAX;
     }
+    // hash-only lookup, valid only when !collide
+    uint32_t findh(uint64_t h)const{
+        size_t i=h&mask;
+        while(t[i].i){
+            if(t[i].h==h)return t[i].i-1;
+            i=(i+1)&mask;
+        }
+        return UINT32_MAX;
+    }
     uint32_t add(sv k,uint64_t h,bool&added){
         if((keys.size()+1)*2>t.size())grow();
         size_t i=h&mask;
         while(t[i].i){
-            if(t[i].h==h&&keys[t[i].i-1]==k){added=false;return t[i].i-1;}
+            if(t[i].h==h){
+                if(keys[t[i].i-1]==k){added=false;return t[i].i-1;}
+                collide=true;
+            }
             i=(i+1)&mask;
         }
         keys.push_back(k);
@@ -107,7 +119,39 @@ struct FM{
         }
     }
 };
- 
+
+// per-bucket person map keyed by the 64-bit hash only (people never collide in practice)
+struct HM{
+    struct S{uint64_t h;uint32_t i;};
+    vector<S> t;
+    vector<sv> names;
+    size_t mask;
+    HM(){t.assign(1024,S{0,0});mask=1023;}
+    uint32_t add(uint64_t h,sv name){
+        if((names.size()+1)*2>t.size())grow();
+        size_t i=h&mask;
+        while(t[i].i){
+            if(t[i].h==h)return t[i].i-1;
+            i=(i+1)&mask;
+        }
+        names.push_back(name);
+        t[i]=S{h,(uint32_t)names.size()};
+        return (uint32_t)names.size()-1;
+    }
+    void grow(){
+        vector<S> o;
+        o.swap(t);
+        size_t c=o.size()*2;
+        t.assign(c,S{0,0});
+        mask=c-1;
+        for(auto&s:o)if(s.i){
+            size_t i=s.h&mask;
+            while(t[i].i)i=(i+1)&mask;
+            t[i]=s;
+        }
+    }
+};
+
 static vector<string> listcsv(const string&dir){
     vector<string> r;
     DIR*d=opendir(dir.c_str());
@@ -120,9 +164,9 @@ static vector<string> listcsv(const string&dir){
     sort(r.begin(),r.end());
     return r;
 }
- 
+
 struct Chunk{const char*b;const char*e;};
- 
+
 static void addChunks(const vector<string>&paths,vector<Chunk>&out,size_t CH){
     for(const string&path:paths){
         int fd=open(path.c_str(),O_RDONLY);
@@ -147,45 +191,75 @@ static void addChunks(const vector<string>&paths,vector<Chunk>&out,size_t CH){
         }
     }
 }
- 
-static bool split(const char*p,const char*e,int nc,sv*out){
-    int k=0;
-    while(true){
-        const char*c=p;
-        while(c<e&&*c!=',')c++;
-        if(k>=nc)return false;
-        const char*a=p;
-        const char*b=c;
-        if(b>a&&*a=='"'){
-            if(b-a<2||b[-1]!='"')return false;
-            a++;b--;
+
+// rough row-count estimate from the first couple of chunks (only used to pre-size buffers)
+static size_t estRows(const vector<Chunk>&cs){
+    size_t tb=0;
+    for(auto&c:cs)tb+=(size_t)(c.e-c.b);
+    size_t sb=0,sl=0;
+    for(size_t k=0;k<cs.size()&&k<2;k++){
+        const char*p=cs[k].b,*e=cs[k].e;
+        sb+=(size_t)(e-p);
+        while(p<e){
+            const char*q=(const char*)memchr(p,'\n',e-p);
+            if(!q)break;
+            sl++;
+            p=q+1;
         }
-        if(b>a&&memchr(a,'"',b-a))return false;
-        out[k++]=sv(a,b-a);
-        if(c==e)break;
-        p=c+1;
     }
-    return k==nc;
+    return sb?(size_t)((double)tb/(double)sb*(double)sl):0;
 }
- 
+
+// Single-pass line parser. Same semantics as: split on commas, strip one pair of
+// surrounding quotes, reject any other quote, require exactly nc fields.
+// Always sets next to the start of the following line.
+static inline bool parseLine(const char*p,const char*e,int nc,sv*out,const char*&next){
+    int k=0;
+    for(;;){
+        if(k>=nc)goto bad;
+        if(p<e&&*p=='"'){
+            p++;
+            const char*s=p;
+            while(p<e&&*p!='"'&&*p!=','&&*p!='\n')p++;
+            if(p>=e||*p!='"')goto bad;
+            out[k++]=sv(s,(size_t)(p-s));
+            p++;
+            if(p<e&&*p!=','&&*p!='\n')goto bad;
+        }else{
+            const char*s=p;
+            while(p<e&&*p!=','&&*p!='\n'&&*p!='"')p++;
+            if(p<e&&*p=='"')goto bad;
+            out[k++]=sv(s,(size_t)(p-s));
+        }
+        if(p>=e){next=e;return k==nc;}
+        if(*p=='\n'){next=p+1;return k==nc;}
+        p++; // skip comma
+    }
+bad:
+    {
+        const char*q=p<e?(const char*)memchr(p,'\n',(size_t)(e-p)):nullptr;
+        next=q?q+1:e;
+        return false;
+    }
+}
+
 template<class F> static void rows(const Chunk&ch,int nc,F f){
     const char*p=ch.b;
     const char*e=ch.e;
     sv fields[8];
     while(p<e){
-        const char*q=(const char*)memchr(p,'\n',e-p);
-        const char*le=q?q:e;
-        if(split(p,le,nc,fields))f(fields);
-        p=q?q+1:e;
+        const char*next;
+        if(parseLine(p,e,nc,fields,next))f(fields);
+        p=next;
     }
 }
- 
+
 template<class F> static void eachrow(const vector<string>&paths,int nc,F f){
     vector<Chunk> c;
     addChunks(paths,c,(size_t)1<<40);
     for(auto&ch:c)rows(ch,nc,f);
 }
- 
+
 static inline bool dg(char c){return c>='0'&&c<='9';}
 static inline int num(const char*p,int n){
     int v=0;
@@ -200,7 +274,7 @@ static ll days_from_civil(ll y,int m,int d){
     ll doe=yoe*365+yoe/4-yoe/100+doy;
     return era*146097+doe-719468;
 }
- 
+
 static ll parse_ts(sv s){
     size_t n=s.size();
     if(n==0)return BAD;
@@ -240,7 +314,7 @@ static ll parse_ts(sv s){
     ll days=days_from_civil(y,mo,d);
     return ((days*86400LL+h*3600LL+mi*60LL+se)*1000LL)-off;
 }
- 
+
 static ll parse_price(sv s){
     size_t n=s.size();
     if(n==0)return -1;
@@ -252,7 +326,7 @@ static ll parse_price(sv s){
     for(;k<n;k++)v=v*10+(s[k]-'0');
     return (v>=1&&v<=10000000)?v:-1;
 }
- 
+
 // ---------------- minimal Parquet writer ----------------
 struct TW{
     string b;vector<int> st;int cur=0;
@@ -363,8 +437,8 @@ static void writeParquet(const string&path,vector<Col>&cols,ll nrows){
     fwrite(f.data(),1,f.size(),fp);
     fclose(fp);
 }
- 
-// ---- links (single-threaded build, read-only afterwards) ----
+
+// ---- links (built on its own thread, read-only afterwards) ----
 static FM lm;
 static vector<uint32_t> par;
 struct Root{sv name;uint64_t h;};
@@ -380,27 +454,48 @@ static uint32_t findr(uint32_t x){
     }
     return x;
 }
- 
-struct EvRec{sv id,user,prod;uint64_t h;ll ts,ing,price;int type;};
+static inline uint32_t linkFind(sv name,uint64_t nh){
+    return lm.collide?lm.find(name,nh):lm.findh(nh);
+}
+
+// 64 bytes: one cache line
+struct EvRec{
+    const char*idp;const char*up;
+    uint64_t h,uh;
+    ll ts,ing;
+    int32_t price;
+    uint32_t idl,ul;
+    uint8_t cat,type,pe;
+};
 struct EvB{sv name;uint64_t nh;ll ts;int32_t price;uint8_t cat;};
 struct CkB{sv name;uint64_t nh;ll ts;uint32_t camp;sv id;};
-struct E2{uint32_t p;ll ts;int32_t price;uint8_t cat;};
-struct K2{uint32_t p;ll ts;uint32_t camp;sv id;};
+struct E3{ll ts;int32_t price;uint8_t cat;};
+struct K3{ll ts;uint32_t camp;sv id;};
 struct CA{ll s=0,ps=0,rev=0,as=0;};
 struct UdRow{sv name;int32_t day;ll s,e,r;int cat;};
 struct Out{vector<UdRow> ud;};
 struct Slot{uint64_t h;uint32_t idx;};
- 
+
+template<class T,class C> static inline void sortRange(T*a,size_t m,C cmp){
+    if(m<2)return;
+    if(m<=24){
+        for(size_t i=1;i<m;i++){
+            T v=a[i];
+            size_t j=i;
+            while(j>0&&cmp(v,a[j-1])){a[j]=a[j-1];j--;}
+            a[j]=v;
+        }
+    }else sort(a,a+m,cmp);
+}
+
 int main(){
-    mallopt(M_TRIM_THRESHOLD,-1);
     const char*e1=getenv("DATA_DIR");
     const char*e3=getenv("NCPU");
     string DATA=e1?e1:"/data";
     string OUT=getenv("OUTPUT_DIR")?getenv("OUTPUT_DIR"):"/output";
     if(e3)NT=max(1,atoi(e3));
     else NT=max(1,(int)thread::hardware_concurrency());
-    mallopt(M_ARENA_MAX,NT);
- 
+
     ll WS,WE;
     {
         ifstream in(DATA+"/manifest.json");
@@ -415,9 +510,13 @@ int main(){
         WS=getw("window_start");
         WE=getw("window_end");
     }
+    if(WS==BAD||WE==BAD||WE<=WS){
+        fprintf(stderr,"bad or missing manifest in %s\n",DATA.c_str());
+        return 1;
+    }
     D0=WS/DAY;
     ND=(int)((WE-1)/DAY-D0+1);
- 
+
     set<sv> catset;
     vector<pair<sv,sv>> prows;
     eachrow({DATA+"/products.csv"},2,[&](sv*f){
@@ -439,7 +538,7 @@ int main(){
         else pcat[i]=catid[pr.second];
     }
     int ncat=(int)catnames.size();
- 
+
     FM cm;
     vector<sv> campid,campch;
     eachrow({DATA+"/campaigns.csv"},2,[&](sv*f){
@@ -451,8 +550,18 @@ int main(){
     uint32_t ncamp=(uint32_t)campid.size();
     uint32_t organic=ncamp;
     lap("setup");
- 
+
+    // ---- links build on its own thread, overlapped with phase A ----
+    vector<Chunk> echunks;
+    addChunks(listcsv(DATA+"/events"),echunks,4<<20);
+    size_t estE=estRows(echunks);
+    vector<vector<vector<EvRec>>> loc(NT,vector<vector<EvRec>>(NS));
     {
+        size_t per=estE/((size_t)NT*NS)*3/2+32;
+        for(int t=0;t<NT;t++)for(int s=0;s<NS;s++)loc[t][s].reserve(per);
+    }
+
+    thread lt([&]{
         vector<pair<uint32_t,uint32_t>> edges;
         eachrow(listcsv(DATA+"/links"),2,[&](sv*f){
             if(f[0].empty()||f[1].empty())return;
@@ -475,31 +584,45 @@ int main(){
             sv nm=lm.keys[par[k]];
             root[k]={nm,hsh(nm)};
         }
-    }
-    lap("links");
- 
+    });
+
     // ---- phase A: parallel parse events into shards ----
-    vector<Chunk> echunks;
-    addChunks(listcsv(DATA+"/events"),echunks,4<<20);
-    vector<vector<vector<EvRec>>> loc(NT,vector<vector<EvRec>>(NS));
     pfor(echunks.size(),[&](size_t ci,int tid){
         rows(echunks[ci],7,[&](sv*f){
             if(f[0].empty())return;
             ll ing=parse_ts(f[3]);
             if(ing==BAD)ing=LLONG_MAX;
-            int type=0;
+            uint8_t type=0;
             if(f[4]=="view")type=1;
             else if(f[4]=="cart")type=2;
             else if(f[4]=="purchase")type=3;
-            uint64_t h=hsh(f[0]);
-            EvRec rec{f[0],f[1],f[5],h,parse_ts(f[2]),ing,type==3?parse_price(f[6]):-1,type};
-            loc[tid][shardH(h,NS)].push_back(rec);
+            EvRec r;
+            r.idp=f[0].data();r.idl=(uint32_t)f[0].size();
+            r.up=f[1].data();r.ul=(uint32_t)f[1].size();
+            r.h=hsh(f[0]);
+            r.uh=f[1].empty()?0:hsh(f[1]);
+            r.ts=parse_ts(f[2]);
+            r.ing=ing;
+            r.price=type==3?(int32_t)parse_price(f[6]):-1;
+            r.cat=0;
+            if(type==3&&r.price>=1){
+                uint32_t pi=pm.find(f[5],hsh(f[5]));
+                r.cat=pi==UINT32_MAX?unk:pcat[pi];
+            }
+            r.type=type;
+            r.pe=f[5].empty()?1:0;
+            loc[tid][shardH(r.h,NS)].push_back(r);
         });
     });
-    lap("A parse events");
- 
+    lt.join();
+    lap("links+A");
+
     // ---- phase B: dedup per shard, validate, route to person buckets ----
     vector<vector<vector<EvB>>> eb(NT,vector<vector<EvB>>(NB));
+    {
+        size_t per=estE/((size_t)NT*NB)*3/2+32;
+        for(int t=0;t<NT;t++)for(int b=0;b<NB;b++)eb[t][b].reserve(per);
+    }
     pfor(NS,[&](size_t s,int tid){
         size_t tot=0;
         for(int t=0;t<NT;t++)tot+=loc[t][s].size();
@@ -515,7 +638,7 @@ int main(){
             while(tab[i].idx){
                 if(tab[i].h==r.h){
                     const EvRec*k=kept[tab[i].idx-1];
-                    if(k->id==r.id){
+                    if(sv(k->idp,k->idl)==sv(r.idp,r.idl)){
                         if(r.ing<k->ing)kept[tab[i].idx-1]=&r;
                         found=true;
                         break;
@@ -530,28 +653,21 @@ int main(){
         }
         const size_t PF=8;
         for(size_t j=0;j<kept.size();j++){
+            if(j+2*PF<kept.size())__builtin_prefetch(kept[j+2*PF]);
             if(j+PF<kept.size()){
                 const EvRec*q=kept[j+PF];
-                if(!q->user.empty()){
-                    uint64_t qh=hsh(q->user);
-                    __builtin_prefetch(&lm.t[qh&lm.mask]);
-                }
+                __builtin_prefetch(&lm.t[q->uh&lm.mask]);
             }
             const EvRec&r=*kept[j];
-            if(r.user.empty()||r.ts==BAD||r.ts<WS||r.ts>=WE)continue;
-            if(r.type==0||r.prod.empty())continue;
+            if(r.ul==0||r.ts==BAD||r.ts<WS||r.ts>=WE)continue;
+            if(r.type==0||r.pe)continue;
             if(r.type==3&&r.price<1)continue;
             if(r.ing-r.ts>DAY)continue;
-            int32_t price=0;
-            uint8_t cat=0;
-            if(r.type==3){
-                price=(int32_t)r.price;
-                uint32_t pi=pm.find(r.prod,hsh(r.prod));
-                cat=pi==UINT32_MAX?unk:pcat[pi];
-            }
-            sv name=r.user;
-            uint64_t nh=hsh(name);
-            uint32_t li=lm.find(name,nh);
+            int32_t price=r.type==3?r.price:0;
+            uint8_t cat=r.type==3?r.cat:0;
+            sv name(r.up,r.ul);
+            uint64_t nh=r.uh;
+            uint32_t li=linkFind(name,nh);
             if(li!=UINT32_MAX){
                 name=root[li].name;
                 nh=root[li].h;
@@ -560,11 +676,16 @@ int main(){
         }
     });
     lap("B dedup+route");
- 
+
     // ---- clicks: parallel parse and route ----
     vector<Chunk> cchunks;
     addChunks(listcsv(DATA+"/clicks"),cchunks,4<<20);
     vector<vector<vector<CkB>>> cb(NT,vector<vector<CkB>>(NB));
+    {
+        size_t estC=estRows(cchunks);
+        size_t per=estC/((size_t)NT*NB)*3/2+32;
+        for(int t=0;t<NT;t++)for(int b=0;b<NB;b++)cb[t][b].reserve(per);
+    }
     pfor(cchunks.size(),[&](size_t ci,int tid){
         rows(cchunks[ci],4,[&](sv*f){
             if(f[0].empty()||f[1].empty())return;
@@ -574,7 +695,7 @@ int main(){
             if(ts==BAD||ts<WS-WEEK||ts>=WE)return;
             sv name=f[1];
             uint64_t nh=hsh(name);
-            uint32_t li=lm.find(name,nh);
+            uint32_t li=linkFind(name,nh);
             if(li!=UINT32_MAX){
                 name=root[li].name;
                 nh=root[li].h;
@@ -583,37 +704,44 @@ int main(){
         });
     });
     lap("clicks");
- 
-    // ---- phase C: per bucket sort + sweep ----
+
+    // ---- phase C: per bucket group by person (counting sort) + sweep ----
     vector<Out> outs(NB);
     vector<vector<CA>> tcam(NT,vector<CA>((size_t)(ncamp+1)*ND));
     pfor(NB,[&](size_t b,int tid){
         CA*cam=tcam[tid].data();
-        FM pl;
-        auto pid=[&](sv s,uint64_t h){
-            bool a;
-            return pl.add(s,h,a);
-        };
-        size_t n=0;
-        for(int t=0;t<NT;t++)n+=eb[t][b].size();
-        vector<E2> ev;
-        ev.reserve(n);
-        for(int t=0;t<NT;t++)for(const EvB&x:eb[t][b])ev.push_back({pid(x.name,x.nh),x.ts,x.price,x.cat});
-        size_t nc=0;
-        for(int t=0;t<NT;t++)nc+=cb[t][b].size();
-        vector<K2> ck;
-        ck.reserve(nc);
-        for(int t=0;t<NT;t++)for(const CkB&x:cb[t][b])ck.push_back({pid(x.name,x.nh),x.ts,x.camp,x.id});
-        sort(ev.begin(),ev.end(),[](const E2&a,const E2&c){
-            if(a.p!=c.p)return a.p<c.p;
-            return a.ts<c.ts;
-        });
-        sort(ck.begin(),ck.end(),[](const K2&a,const K2&c){
-            if(a.p!=c.p)return a.p<c.p;
-            if(a.ts!=c.ts)return a.ts<c.ts;
-            return a.id<c.id;
-        });
- 
+        HM pl;
+        size_t n=0,nc=0;
+        for(int t=0;t<NT;t++){n+=eb[t][b].size();nc+=cb[t][b].size();}
+        vector<uint32_t> pe_(n),pc_(nc);
+        {
+            size_t k=0;
+            for(int t=0;t<NT;t++)for(const EvB&x:eb[t][b])pe_[k++]=pl.add(x.nh,x.name);
+            k=0;
+            for(int t=0;t<NT;t++)for(const CkB&x:cb[t][b])pc_[k++]=pl.add(x.nh,x.name);
+        }
+        uint32_t np=(uint32_t)pl.names.size();
+        vector<uint32_t> es(np+1,0),cs(np+1,0);
+        for(size_t k=0;k<n;k++)es[pe_[k]+1]++;
+        for(size_t k=0;k<nc;k++)cs[pc_[k]+1]++;
+        for(uint32_t p=0;p<np;p++){es[p+1]+=es[p];cs[p+1]+=cs[p];}
+        vector<E3> ev(n);
+        vector<K3> ck(nc);
+        {
+            vector<uint32_t> ep(es.begin(),es.end()-1),cp(cs.begin(),cs.end()-1);
+            size_t k=0;
+            for(int t=0;t<NT;t++)for(const EvB&x:eb[t][b])ev[ep[pe_[k++]]++]=E3{x.ts,x.price,x.cat};
+            k=0;
+            for(int t=0;t<NT;t++)for(const CkB&x:cb[t][b])ck[cp[pc_[k++]]++]=K3{x.ts,x.camp,x.id};
+        }
+        for(uint32_t p=0;p<np;p++){
+            sortRange(ev.data()+es[p],es[p+1]-es[p],[](const E3&a,const E3&c){return a.ts<c.ts;});
+            sortRange(ck.data()+cs[p],cs[p+1]-cs[p],[](const K3&a,const K3&c){
+                if(a.ts!=c.ts)return a.ts<c.ts;
+                return a.id<c.id;
+            });
+        }
+
         Out&o=outs[b];
         vector<int> cov(ncamp,-1);
         vector<uint32_t> touched;
@@ -626,19 +754,15 @@ int main(){
             int best=-1;
             ll mx=0;
             for(int k=0;k<ncat;k++)if(daycat[k]>mx){mx=daycat[k];best=k;}
-            o.ud.push_back({pl.keys[p],(int32_t)curday,dsess,devs,drev,best});
+            o.ud.push_back({pl.names[p],(int32_t)curday,dsess,devs,drev,best});
             fill(daycat.begin(),daycat.end(),0);
             curday=-1;dsess=0;devs=0;drev=0;
         };
- 
-        size_t cbp=0,i=0;
-        while(i<ev.size()){
-            uint32_t p=ev[i].p;
-            size_t ie=i;
-            while(ie<ev.size()&&ev[ie].p==p)ie++;
-            while(cbp<ck.size()&&ck[cbp].p<p)cbp++;
-            size_t ce=cbp;
-            while(ce<ck.size()&&ck[ce].p==p)ce++;
+
+        for(uint32_t p=0;p<np;p++){
+            size_t i=es[p],ie=es[p+1];
+            if(i==ie)continue;
+            size_t cbp=cs[p],ce=cs[p+1];
             size_t lo=cbp,hi=cbp;
             sst.clear();slot.clear();dd.clear();dlo.clear();dhi.clear();
             size_t e=i;
@@ -696,17 +820,15 @@ int main(){
             }
             for(uint32_t c:touched)cov[c]=-1;
             touched.clear();
-            cbp=ce;
-            i=ie;
         }
     });
-    lap("C sort+sweep");
- 
+    lap("C group+sweep");
+
     // ---- output: write Parquet directly ----
     mkdir(OUT.c_str(),0755);
     mkdir((OUT+"/user_daily").c_str(),0755);
     mkdir((OUT+"/campaign_daily").c_str(),0755);
- 
+
     vector<thread> wt;
     for(int w=0;w<NT;w++)wt.emplace_back([&,w]{
         vector<Col> c(6);
@@ -729,7 +851,7 @@ int main(){
         }
         if(n||w==0)writeParquet(OUT+"/user_daily/part-"+to_string(w)+".parquet",c,n);
     });
- 
+
     {
         vector<CA> cam((size_t)(ncamp+1)*ND);
         for(int t=0;t<NT;t++)for(size_t k=0;k<cam.size();k++){
@@ -766,4 +888,3 @@ int main(){
     fflush(stderr);
     _exit(0);
 }
- 
